@@ -251,11 +251,17 @@ stashed on `globalThis` and reused when the module is re-imported.
 
 ## Known limitations
 
-- **HITL after restart:** The module-level `pendingHITL` map is lost on process
-  restart. The durable `state.pendingInput` survives, and eve auto-matches
-  follow-up text against option IDs/labels/indices, so HITL still works — but
-  explicit `respond()` routing (vs. eve's auto-matching) resumes only after the
-  next `input.requested` event repopulates the map.
+- **HITL after restart (mitigated):** The module-level `pendingHITL` map is
+  lost on process restart, but the durable `state.pendingInput` survives.
+  When `pendingHITL` is empty, the inbound handler falls through to
+  `from(jid).send(text)`, and eve's built-in auto-matching resolves the reply
+  against the durable state (option ID, label, or numeric index). Explicit
+  `respond()` routing resumes after the next `input.requested` event
+  repopulates the map.
+- **Bootstrap recovery:** Bootstrap retries indefinitely with exponential
+  backoff (500ms → 30s cap). A safety net in `dispatchInbound` also triggers
+  a bootstrap attempt when a message arrives and `from` is not yet captured.
+  Messages remain queued until bootstrap succeeds.
 - **No streaming:** Messages are sent once on `message.completed`, not
   edit-as-you-go. WhatsApp does not support message editing well.
 - **No group support:** `@g.us` JIDs are filtered out by design. DMs use both
@@ -269,6 +275,10 @@ stashed on `globalThis` and reused when the module is re-imported.
   also fires during `eve build`. This is harmless (the build completes and the
   socket is discarded), but it means a QR code may print during `eve build`
   even though no server is running.
+- **Duplicate listener protection:** A `listenersAttached` flag on
+  `globalThis` prevents duplicate `messages.upsert` listeners during hot
+  reload. The flag is reset when the socket closes (new socket needs fresh
+  listeners).
 
 ## Key source files
 

@@ -104,6 +104,13 @@ interface CapturedFrom {
   };
 }
 
+/**
+ * `resolveSession` captured from the bootstrap route. Snapshots the session
+ * currently owning a channel-local address. Used as a restart-safe fallback
+ * to check whether a session exists for a JID before dispatching.
+ */
+type CapturedResolveSession = (address: string) => Promise<unknown | undefined>;
+
 /** A queued inbound message waiting for `from` to be captured. */
 interface QueuedMessage {
   jid: string;
@@ -128,16 +135,26 @@ interface GlobalState {
   socket: WASocket | null;
   socketStarting: Promise<WASocket> | null;
   capturedFrom: CapturedFrom | null;
+  capturedResolveSession: CapturedResolveSession | null;
   messageQueue: QueuedMessage[];
   /**
    * Module-level mirror of pending HITL requests, keyed by JID. The inbound
    * handler runs outside eve's event system and cannot read channel state
    * directly, so we mirror `state.pendingInput` here for quick lookup. This is
-   * non-durable (lost on restart), but eve's durable `state.pendingInput`
-   * survives restarts and eve auto-matches follow-up text against options, so
-   * the module-level map is an optimization for explicit `respond()` routing.
+   * non-durable (lost on restart). After a restart, the `pendingHITL` map is
+   * empty — the inbound handler falls through to `from(jid).send(text)`, and
+   * eve's built-in auto-matching (option ID, label, or numeric index) handles
+   * the reply against the durable `state.pendingInput`. See HITL docs:
+   * "A follow-up whose text matches an option ID, option label, or numeric
+   * option index resolves automatically."
    */
   pendingHITL: Map<string, { requestId: string; options: { id: string; label: string }[]; allowFreeform: boolean }>;
+  /**
+   * Prevents duplicate Baileys event listeners on the same socket during hot
+   * reload. Set to true after `sock.ev.on(...)` calls. Reset when a new socket
+   * is created (the old listeners die with the old socket).
+   */
+  listenersAttached: boolean;
 }
 
 function getGlobal(): GlobalState {
@@ -147,8 +164,10 @@ function getGlobal(): GlobalState {
       socket: null,
       socketStarting: null,
       capturedFrom: null,
+      capturedResolveSession: null,
       messageQueue: [],
       pendingHITL: new Map(),
+      listenersAttached: false,
     } satisfies GlobalState;
   }
   return g[GLOBAL_KEY] as GlobalState;
@@ -157,8 +176,10 @@ function getGlobal(): GlobalState {
 let socket: WASocket | null;
 let socketStarting: Promise<WASocket> | null;
 let capturedFrom: CapturedFrom | null;
+let capturedResolveSession: CapturedResolveSession | null;
 let messageQueue: QueuedMessage[];
 let pendingHITL: Map<string, { requestId: string; options: { id: string; label: string }[]; allowFreeform: boolean }>;
+let listenersAttached: boolean;
 
 {
   // Initialize module-level vars from the global singleton.
@@ -166,8 +187,10 @@ let pendingHITL: Map<string, { requestId: string; options: { id: string; label: 
   socket = g.socket;
   socketStarting = g.socketStarting;
   capturedFrom = g.capturedFrom;
+  capturedResolveSession = g.capturedResolveSession;
   messageQueue = g.messageQueue;
   pendingHITL = g.pendingHITL;
+  listenersAttached = g.listenersAttached;
 }
 
 /** Sync module-level vars back to the global singleton (after mutations). */
@@ -176,8 +199,10 @@ function syncToGlobal(): void {
   g.socket = socket;
   g.socketStarting = socketStarting;
   g.capturedFrom = capturedFrom;
+  g.capturedResolveSession = capturedResolveSession;
   g.messageQueue = messageQueue;
   g.pendingHITL = pendingHITL;
+  g.listenersAttached = listenersAttached;
 }
 
 const AUTH_DIR = "./auth_info_baileys";
@@ -234,6 +259,7 @@ async function connectSocket(): Promise<WASocket> {
         );
         socket = null;
         socketStarting = null;
+        listenersAttached = false;
         syncToGlobal();
         if (shouldReconnect) {
           // Bounded delay to avoid hammering WhatsApp on rapid disconnects.
@@ -269,31 +295,33 @@ async function connectSocket(): Promise<WASocket> {
  * HTTP-centric channel model: the route handler has access to `from`, which
  * closes over the stable runtime and can be reused for all socket-driven sends.
  *
- * Retries with bounded backoff so startup cannot get permanently stuck if the
- * HTTP server is not yet listening when the socket connects.
+ * Retries indefinitely with exponential backoff (capped at 30s) so startup
+ * can never get permanently stuck. If eve's HTTP server is slow to start,
+ * messages remain queued until the bootstrap succeeds and drains them.
  */
 async function bootstrapFrom(): Promise<void> {
   const port = process.env.PORT ?? "2000";
   const url = `http://127.0.0.1:${port}/whatsapp/bootstrap`;
-  const maxAttempts = 10;
-  const baseDelay = 500;
+  const maxDelay = 30_000;
+  let delay = 500;
+  let attempt = 0;
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+  while (true) {
+    attempt++;
     try {
+      console.info(`[whatsapp] bootstrap attempt ${attempt}...`);
       const res = await fetch(url, { method: "POST" });
-      if (res.ok) return;
+      if (res.ok) {
+        console.info(`[whatsapp] bootstrap succeeded on attempt ${attempt}`);
+        return;
+      }
     } catch {
       // Server not listening yet — retry after backoff.
     }
-    if (attempt < maxAttempts) {
-      const delay = Math.min(baseDelay * attempt, 5000);
-      await new Promise((resolve) => setTimeout(resolve, delay));
-    }
+    console.info(`[whatsapp] bootstrap attempt ${attempt} failed, retrying in ${delay}ms`);
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    delay = Math.min(delay * 2, maxDelay);
   }
-  console.error(
-    `[whatsapp] bootstrap failed after ${maxAttempts} attempts — ` +
-      "`from` not captured. Inbound messages will queue until a route is hit.",
-  );
 }
 
 // ---------------------------------------------------------------------------
@@ -313,14 +341,33 @@ async function dispatchInbound(
   // `from` not captured yet — queue for when the bootstrap route fires.
   messageQueue.push({ jid, content, state });
   syncToGlobal();
+  // Safety net: if the automatic bootstrap from `connection.update → open`
+  // hasn't succeeded yet (e.g. eve started after WhatsApp connected), trigger
+  // another bootstrap attempt now. This is idempotent — the bootstrap route
+  // no-ops if `from` is already captured.
+  void bootstrapFrom();
 }
 
 /**
  * Wire the socket's message listener. Called once on module load.
- * Attaches to the `messages.upsert` event.
+ * Guards against duplicate listener attachment on the same socket (which
+ * would cause one WhatsApp message to trigger multiple eve turns).
+ *
+ * The `listenersAttached` flag is:
+ * - Set to `true` after attaching `messages.upsert` (and other listeners).
+ * - Reset to `false` when a new socket is created (old listeners die with
+ *   the old socket; the flag must be cleared so the new socket can attach).
+ * - Stored on `globalThis` so hot-reloaded module imports don't re-attach.
  */
 function wireSocketListener(): void {
   void connectSocket().then((sock) => {
+    // Guard: if listeners are already attached to this socket (e.g. after a
+    // hot reload that re-executes this module), skip re-attaching.
+    if (listenersAttached) {
+      console.info("[whatsapp] listeners already attached, skipping");
+      return;
+    }
+
     sock.ev.on(
       "messages.upsert",
       async ({ messages, type }: BaileysEventMap["messages.upsert"]) => {
@@ -340,6 +387,9 @@ function wireSocketListener(): void {
         }
       },
     );
+
+    listenersAttached = true;
+    syncToGlobal();
   });
 }
 
@@ -496,19 +546,34 @@ async function handleInboundMessage(msg: WAMessage): Promise<void> {
 /**
  * Try to resolve an inbound text message as a HITL response.
  *
- * Checks the module-level `pendingHITL` map (mirrored from the durable
- * `state.pendingInput` by the `input.requested` event handler).
+ * Two-tier strategy:
  *
- * - For option-based prompts: "1", "2", "3" etc. map to the corresponding
- *   option's `id`. Invalid numbers are rejected cleanly.
- * - For freeform prompts: the user's text is sent as the response.
+ * 1. **Fast path** — Check the module-level `pendingHITL` map (mirrored from
+ *    the durable `state.pendingInput` by the `input.requested` handler). If
+ *    found, resolve explicitly via `from(jid).respond()`:
+ *    - Option-based: "1", "2", "3" map to the corresponding `optionId`.
+ *      Invalid numbers are rejected cleanly with a re-rendered prompt.
+ *    - Freeform: the user's text is sent as the `text` field.
+ *
+ * 2. **Fallback (restart-safe)** — If `pendingHITL` is empty (e.g. after a
+ *    process restart where the in-memory map was lost), return `false` so the
+ *    text is dispatched via `from(jid).send(text)`. Eve's built-in auto-matching
+ *    then resolves the reply against the durable `state.pendingInput`:
+ *    "A follow-up whose text matches an option ID, option label, or numeric
+ *    option index resolves automatically" (see eve HITL docs). This is the
+ *    eve-supported mechanism — no custom protocol needed.
  *
  * Returns `true` if the message was consumed as a HITL response, `false`
- * if it should be processed as a normal message.
+ * if it should be processed as a normal message (fallback to eve auto-matching).
  */
 async function tryResolveHITL(jid: string, text: string): Promise<boolean> {
   const pending = pendingHITL.get(jid);
-  if (!pending) return false;
+  if (!pending) {
+    // Fast path miss — either no HITL is pending, or the process restarted
+    // and the in-memory map is empty. Fall through to send() and let eve's
+    // built-in auto-matching handle it against durable state.
+    return false;
+  }
 
   const trimmed = text.trim();
 
@@ -668,9 +733,10 @@ export default defineChannel<WhatsAppState, WhatsAppChannelContext>({
      * messages. Called automatically when the Baileys socket connects (see
      * `bootstrapFrom`), and safe to call manually.
      */
-    POST("/whatsapp/bootstrap", async (_req, { from }) => {
+    POST("/whatsapp/bootstrap", async (_req, { from, resolveSession }) => {
       if (!capturedFrom) {
         capturedFrom = from as unknown as CapturedFrom;
+        capturedResolveSession = resolveSession as unknown as CapturedResolveSession;
         syncToGlobal();
         console.info("[whatsapp] dispatcher captured, draining queue");
       }
