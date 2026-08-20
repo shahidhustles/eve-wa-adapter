@@ -8,3 +8,4 @@ node_modules
 dist
 .DS_Store
 *.tsbuildinfo
+auth_info_baileys
