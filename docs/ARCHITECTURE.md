@@ -100,12 +100,14 @@ let socket: WASocket | null = null;           // the Baileys socket
 let socketStarting: Promise<WASocket> | null; // guards against double-connect
 let capturedFrom: CapturedFrom | null = null;  // the captured eve dispatcher
 const messageQueue: QueuedMessage[] = [];      // buffer before `from` is ready
+const pendingHITL = new Map<string, ...>();    // mirrors state.pendingInput for the socket handler
 ```
 
-`socket` and `capturedFrom` are module-scoped because the channel file is a
-singleton: eve loads `agent/channels/whatsapp.ts` once per process. A
-`globalThis` guard is recommended if `eve dev` hot-reloads the module, to
-avoid duplicate sockets — not implemented yet but noted as a known risk.
+`socket`, `capturedFrom`, and `pendingHITL` are module-scoped but stashed on
+`globalThis` (`__eve_whatsapp_socket__`) so that `eve dev` hot-reloads reuse
+the existing socket instead of creating duplicates. This is the pragmatic
+workaround for eve's lack of a background-channel lifecycle API for push-based
+transports like Baileys.
 
 ### Socket lifecycle (`connectSocket`)
 
@@ -113,13 +115,24 @@ avoid duplicate sockets — not implemented yet but noted as a known risk.
   or prepares an empty auth store. First run has no credentials.
 - `fetchLatestBaileysVersion()` fetches the current WhatsApp Web protocol
   version. If omitted, Baileys uses a baked-in version that may be stale.
-- `makeWASocket({ ..., printQRInTerminal: true })` prints the QR to the
-  terminal on first connect. After scanning via WhatsApp → Linked Devices,
-  credentials are saved to `./auth_info_baileys/` and reused on restart.
+- `makeWASocket({ ..., auth })` creates the socket **without**
+  `printQRInTerminal`. Instead, the `connection.update` handler reads the
+  `qr` field and renders it via the `qrcode` package
+  (`QRCode.toString(qr, { type: "terminal", small: true })`). After scanning
+  via WhatsApp → Linked Devices, credentials are saved to
+  `./auth_info_baileys/` and reused on restart.
 - `connection.update` handler: on `close`, checks the `DisconnectReason`.
-  If the account was not `loggedOut`, it reconnects. If `loggedOut`, it
-  stays disconnected (the session was killed on the phone).
-- On `open`, calls `bootstrapFrom()` to capture `from`.
+  If the account was not `loggedOut`, it reconnects with a bounded delay.
+  If `loggedOut`, it stays disconnected (the session was killed on the phone).
+  If socket initialization throws before `connection.update` fires,
+  `socketStarting`/`socket` are reset in the `.catch()` so a future attempt
+  can succeed.
+- On `open`, calls `bootstrapFrom()` to capture `from`. `bootstrapFrom()`
+  retries up to 10 times with linear backoff (500ms → 5s cap) so startup
+  cannot get permanently stuck if the HTTP server is not yet listening.
+- `messages.upsert` handler: only processes `type === "notify"` (genuinely
+  new messages received live). `type === "append"` (history sync after
+  linking/reconnect) is ignored to prevent replaying old messages.
 
 ### Inbound parsing (`handleInboundMessage`)
 
@@ -127,23 +140,27 @@ Filters first, then dispatches by content type:
 
 | Filter                | Rule                                                        |
 | --------------------- | ---------------------------------------------------------- |
-| DMs only              | `jid.endsWith("@s.whatsapp.net")` — skips `@g.us` groups  |
+| DMs only              | `isPnUser(jid) \|\| isLidUser(jid)` — Baileys helpers for `@s.whatsapp.net` and LID `@lid` JIDs. Skips `@g.us` groups. |
 | Skip own messages     | `msg.key.fromMe === true` (echo of our outbound)           |
 | Skip stickers         | `type === "stickerMessage"`                                |
+| New messages only     | `messages.upsert` `type === "notify"` (not `append`)      |
 
-Then a `switch` on `getContentType(msg.message)`:
+Messages are first passed through `normalizeMessageContent()` to unwrap
+ephemeral, view-once, document-with-caption, and edited message wrappers to
+their inner content type. Then a `switch` on `getContentType(normalizedMessage)`:
 
 | Type               | Handling                                                        |
 | ------------------ | --------------------------------------------------------------- |
-| `conversation` / `extendedTextMessage` | Text part: `{ type: "text", text }`            |
-| `audioMessage`     | `downloadMediaMessage(msg, "buffer")` → file part `audio/ogg`. Sets `voiceReply = ptt === true`. **STT hook** here. |
-| `imageMessage`     | Download → file part with mimetype. Caption → text part.        |
-| `videoMessage`     | Download → file part with mimetype. Caption → text part.        |
+| `conversation` / `extendedTextMessage` | Text part: `{ type: "text", text }`. HITL resolution checked first. |
+| `audioMessage`     | `downloadMediaMessage(msg, "buffer", {}, { reuploadRequest: sock.updateMediaMessage })` → file part with mimetype. Sets `voiceReply = ptt === true`. **STT hook** here. |
+| `imageMessage`     | Download (with reupload) → file part with mimetype. Caption → text part. |
+| `videoMessage`     | Download (with reupload) → file part with mimetype. Caption → text part. |
 | `locationMessage`  | Text part: `"Location received: lat, lon"` (agent tool handles) |
 | default            | Ignored (stickers already filtered above)                      |
 
-All parts are assembled into a `UserContent` array (AI SDK format) and
-passed to `dispatchInbound()` along with channel state: `{ jid, lastInboundKey, voiceReply }`.
+All media downloads pass `reuploadRequest: sock.updateMediaMessage` so Baileys
+can request a re-upload if the media URL has expired. All parts are assembled
+into a `UserContent` array (AI SDK format) and passed to `dispatchInbound()`.
 
 ### Outbound delivery (`events` map)
 
@@ -186,11 +203,20 @@ Choose a shipping option:
 Reply with a number.
 ```
 
-The pending request is stored in `state.pendingInput`. When the user replies
-with "1" or the label text, a future inbound handler can resolve it via
-`from(jid).respond([{ optionId, requestId }])`. (Resolution matching is
-designed but the inbound path currently sends as a normal message — see
-[Known limitations](#known-limitations).)
+The pending request is stored in **both** `state.pendingInput` (durable, in eve
+channel state) and a module-level `pendingHITL` map (for fast lookup by the
+inbound handler, which runs outside eve's event system).
+
+When the user replies with a number ("1", "2", etc.), the inbound handler maps
+it to the corresponding `optionId` and calls `from(jid).respond([{ requestId,
+optionId }])` — eve's `respond()` API, which never steers and delivers only
+addressed input responses. Invalid numbers on option-only prompts are rejected
+with a re-rendered prompt. Freeform prompts route the user's text via
+`respond([{ requestId, text }])`.
+
+The `pendingHITL` map is non-durable (lost on process restart), but eve's
+durable `state.pendingInput` survives restarts. After a restart, eve's own
+auto-matching handles follow-up text that matches option IDs/labels/indices.
 
 ### Proactive sessions
 
@@ -219,22 +245,30 @@ of the process. Use:
 - `eve start` — long-running Node process (local dev, a VM, or a container)
 - A persistent container (Docker, Fly.io, Railway, a VPS)
 
-The `eve dev` TUI also works, but hot module reload may create duplicate
-sockets. A `globalThis` singleton guard (not yet implemented) would prevent
-this.
+The `eve dev` TUI also works. A `globalThis` singleton guard prevents duplicate
+sockets on hot reload — the socket, `capturedFrom`, and message queue are all
+stashed on `globalThis` and reused when the module is re-imported.
 
 ## Known limitations
 
-- **HITL resolution:** The inbound path sends numeric replies as normal
-  messages rather than resolving them against `state.pendingInput` via
-  `respond()`. eve's steering may auto-match option IDs/labels, but explicit
-  `respond()` routing is not wired in the inbound handler yet.
+- **HITL after restart:** The module-level `pendingHITL` map is lost on process
+  restart. The durable `state.pendingInput` survives, and eve auto-matches
+  follow-up text against option IDs/labels/indices, so HITL still works — but
+  explicit `respond()` routing (vs. eve's auto-matching) resumes only after the
+  next `input.requested` event repopulates the map.
 - **No streaming:** Messages are sent once on `message.completed`, not
   edit-as-you-go. WhatsApp does not support message editing well.
-- **No group support:** `@g.us` JIDs are filtered out by design.
+- **No group support:** `@g.us` JIDs are filtered out by design. DMs use both
+  phone-number JIDs (`@s.whatsapp.net`) and LID-based user JIDs (`@lid`).
 - **No stickers:** Filtered out by design.
-- **TTS/STT stubbed:** Both hooks are commented out. Text fallbacks are used.
-- **Hot reload:** No `globalThis` guard against duplicate sockets in `eve dev`.
+- **TTS/STT stubbed:** Both hooks are commented out. Voice-note replies fall
+  back to text; voice-note inputs are passed as raw audio files.
+- **`fromMe` skip:** Testing via WhatsApp's "Message Yourself" conversation
+  does not work. Test from another WhatsApp account/number.
+- **Module-scope socket:** `wireSocketListener()` runs on module import, which
+  also fires during `eve build`. This is harmless (the build completes and the
+  socket is discarded), but it means a QR code may print during `eve build`
+  even though no server is running.
 
 ## Key source files
 

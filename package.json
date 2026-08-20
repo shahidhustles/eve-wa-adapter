@@ -13,6 +13,7 @@
     "typecheck": "tsc"
   },
   "dependencies": {
+    "@hapi/boom": "^9.1.4",
     "@vercel/connect": "0.4.3",
     "@whiskeysockets/baileys": "^7.0.0-rc14",
     "ai": "^7.0.58",

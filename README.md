@@ -18,20 +18,27 @@ session turns; agent replies are sent back as WhatsApp messages.
 **Supported:**
 
 - Text messages (send + receive)
-- Voice notes / PTT (receive + conditional voice reply via TTS hook)
+- Voice notes / PTT (receive — passed to the agent as an audio file; replies are
+  sent as **text**, not voice, until TTS is wired)
 - Images with captions (receive)
 - Video with captions (receive)
 - GPS location (receive, passed to agent as text coordinates)
-- Human-in-the-loop (HITL) — rendered as numbered text choices
+- Human-in-the-loop (HITL) — rendered as numbered text choices; numeric replies
+  resolve via eve's `respond()` API against the correct `requestId`
 - Proactive sessions — send to a WhatsApp JID from a schedule or another channel
 - Typing indicators, read receipts
 
 **Not supported (by design):**
 
-- Groups (`@g.us` filtered out — DMs only)
+- Groups (`@g.us` filtered out — DMs only, including LID-based users)
 - Stickers
 - Polls, rich buttons, interactive cards
 - Message editing / streaming edits
+- Voice-note *replies* (TTS stubbed — see "Wiring TTS" below)
+
+> **Testing note:** Messages where `msg.key.fromMe === true` are skipped to
+> prevent response loops. This means WhatsApp's "Message Yourself" conversation
+> cannot trigger the bot — test from another WhatsApp account/number.
 
 ## Requirements
 
@@ -47,8 +54,8 @@ session turns; agent replies are sent back as WhatsApp messages.
 ### 1. Install dependencies
 
 ```bash
-npm install @whiskeysockets/baileys @hapi/boom
-npm install -D @types/qrcode qrcode   # optional, for terminal QR rendering
+npm install @whiskeysockets/baileys @hapi/boom qrcode
+npm install -D @types/qrcode   # TypeScript types for qrcode
 ```
 
 ### 2. Add the channel file
@@ -115,9 +122,10 @@ Any STT provider works: OpenAI Whisper, Deepgram, Google Speech-to-Text, etc.
 ## Wiring TTS (text-to-speech)
 
 When the inbound message is a voice note, the channel sets `state.voiceReply = true`
-and replies go through `sendVoiceNote()`. This function is stubbed to fall
-back to text. To send actual voice replies, edit the TTS hook in
-`agent/channels/whatsapp.ts` (around line 338, inside `sendVoiceNote()`):
+and replies go through `sendVoiceNote()`. **Voice-note replies are NOT currently
+supported** — `sendVoiceNote()` falls back to plain text. To send actual voice
+replies, edit the TTS hook in `agent/channels/whatsapp.ts` (inside
+`sendVoiceNote()`):
 
 ```ts
 async function sendVoiceNote(sock: WASocket, jid: string, text: string): Promise<void> {
@@ -134,9 +142,9 @@ async function sendVoiceNote(sock: WASocket, jid: string, text: string): Promise
 
 Any TTS provider works: OpenAI tts-1, ElevenLabs, Google TTS, AWS Polly, etc.
 
-Voice replies are **conditional**: if the user sends a text message, the
-agent replies as text. If the user sends a voice note, the agent replies as
-a voice note.
+Until TTS is wired, the `voiceReply` flag only affects the outbound delivery
+path — the agent's text reply is sent as plain text regardless of whether the
+user sent a voice note.
 
 ## How it works
 
