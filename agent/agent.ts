@@ -1,5 +1,5 @@
 import { defineAgent } from "eve";
 
 export default defineAgent({
-  model: "zai/glm-5.2",
+  model: "stepfun/step-3.5-flash",
 });

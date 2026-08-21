@@ -16,6 +16,13 @@ import {
   DisconnectReason,
 } from "@whiskeysockets/baileys";
 import { Boom } from "@hapi/boom";
+import { Cartesia } from "@cartesia/cartesia-js";
+import { DeepgramClient } from "@deepgram/sdk";
+import { spawn } from "node:child_process";
+import { constants } from "node:fs";
+import { access } from "node:fs/promises";
+import { resolve } from "node:path";
+import ffmpegPath from "ffmpeg-static";
 import QRCode from "qrcode";
 import type { UserContent } from "ai";
 
@@ -27,14 +34,11 @@ import type { UserContent } from "ai";
  * channel captures eve's `from()` dispatcher from a bootstrap HTTP route and
  * reuses it for all subsequent socket-driven dispatches.
  *
- * Supports: text, voice notes (receive + text fallback reply), images, video,
+ * Supports: text, voice notes (Deepgram transcription + Cartesia voice reply), images, video,
  * GPS location, HITL (rendered as numbered text choices), and proactive
- * sessions. Voice note *replies* are NOT supported until TTS is wired — the
- * inbound voice note is passed to the agent as a file, and the agent's text
- * reply is sent as text, not audio.
+ * sessions.
  *
- * Does NOT support: stickers, groups, polls, rich buttons, or actual voice-note
- * replies (TTS stubbed).
+ * Does NOT support: stickers, groups, polls, or rich buttons.
  *
  * First run prints a QR code to the terminal. Scan it via WhatsApp → Linked
  * Devices. Credentials persist to ./auth_info_baileys and are reused on restart.
@@ -101,6 +105,8 @@ interface CapturedFrom {
       inputResponses: readonly WhatsAppInputResponse[],
       options: { auth: unknown; state?: Partial<WhatsAppState> },
     ) => Promise<unknown>;
+    clear: () => Promise<unknown>;
+    reset: (options: { reason: string }) => Promise<unknown>;
   };
 }
 
@@ -155,6 +161,10 @@ interface GlobalState {
    * is created (the old listeners die with the old socket).
    */
   listenersAttached: boolean;
+  /** Reply mode for accepted inbound messages, kept in arrival order per JID. */
+  replyModes: Map<string, boolean[]>;
+  /** Reply mode for the turn currently running for a JID. */
+  activeReplyModes: Map<string, boolean>;
 }
 
 function getGlobal(): GlobalState {
@@ -168,6 +178,8 @@ function getGlobal(): GlobalState {
       messageQueue: [],
       pendingHITL: new Map(),
       listenersAttached: false,
+      replyModes: new Map(),
+      activeReplyModes: new Map(),
     } satisfies GlobalState;
   }
   return g[GLOBAL_KEY] as GlobalState;
@@ -180,6 +192,8 @@ let capturedResolveSession: CapturedResolveSession | null;
 let messageQueue: QueuedMessage[];
 let pendingHITL: Map<string, { requestId: string; options: { id: string; label: string }[]; allowFreeform: boolean }>;
 let listenersAttached: boolean;
+let replyModes: Map<string, boolean[]>;
+let activeReplyModes: Map<string, boolean>;
 
 {
   // Initialize module-level vars from the global singleton.
@@ -191,6 +205,8 @@ let listenersAttached: boolean;
   messageQueue = g.messageQueue;
   pendingHITL = g.pendingHITL;
   listenersAttached = g.listenersAttached;
+  replyModes = g.replyModes;
+  activeReplyModes = g.activeReplyModes;
 }
 
 /** Sync module-level vars back to the global singleton (after mutations). */
@@ -203,9 +219,80 @@ function syncToGlobal(): void {
   g.messageQueue = messageQueue;
   g.pendingHITL = pendingHITL;
   g.listenersAttached = listenersAttached;
+  g.replyModes = replyModes;
+  g.activeReplyModes = activeReplyModes;
 }
 
 const AUTH_DIR = "./auth_info_baileys";
+const DEEPGRAM_MODEL = "nova-3";
+const CARTESIA_MODEL = "sonic-3.5";
+
+function getRequiredEnv(name: "DEEPGRAM_API_KEY" | "CARTESIA_API_KEY" | "CARTESIA_VOICE_ID"): string {
+  const value = process.env[name];
+  if (!value) throw new Error(`${name} is required for voice support`);
+  return value;
+}
+
+async function transcribeVoiceNote(audio: Buffer, mediaType: string): Promise<string> {
+  const deepgram = new DeepgramClient({ apiKey: getRequiredEnv("DEEPGRAM_API_KEY") });
+  const result = await deepgram.listen.v1.media.transcribeFile(
+    { data: audio, contentType: mediaType },
+    { model: DEEPGRAM_MODEL, smart_format: true, punctuate: true },
+  );
+  if (!("results" in result) || !result.results) return "";
+  const channel = result.results.channels?.[0];
+  return channel?.alternatives?.[0]?.transcript?.trim() ?? "";
+}
+
+/** Convert Cartesia's MP3 output to WhatsApp's native voice-note format. */
+async function mp3ToWhatsAppVoiceNote(mp3: Buffer): Promise<Buffer> {
+  // Eve compiles authored modules into a snapshot. `ffmpeg-static`'s JS loader
+  // is copied there, but its native executable is not, so prefer the installed
+  // binary in the project working directory.
+  const candidates = [
+    resolve(process.cwd(), "node_modules", "ffmpeg-static", "ffmpeg"),
+    ffmpegPath,
+  ].filter((path): path is string => Boolean(path));
+  const executable = await (async () => {
+    for (const candidate of candidates) {
+      try {
+        await access(candidate, constants.X_OK);
+        return candidate;
+      } catch {
+        // Try the next location.
+      }
+    }
+    throw new Error("ffmpeg-static did not provide an executable for this platform");
+  })();
+
+  return new Promise((resolve, reject) => {
+    const ffmpeg = spawn(
+      executable,
+      [
+        "-hide_banner",
+        "-loglevel", "error",
+        "-i", "pipe:0",
+        "-vn",
+        "-ac", "1",
+        "-c:a", "libopus",
+        "-b:a", "32k",
+        "-f", "ogg",
+        "pipe:1",
+      ],
+      { stdio: "pipe" },
+    );
+    const output: Buffer[] = [];
+    const errors: Buffer[] = [];
+    ffmpeg.stdout.on("data", (chunk: Buffer) => output.push(chunk));
+    ffmpeg.stderr.on("data", (chunk: Buffer) => errors.push(chunk));
+    ffmpeg.once("error", reject);
+    ffmpeg.once("close", (code) => {
+      if (code === 0) return resolve(Buffer.concat(output));
+      reject(new Error(`ffmpeg exited with code ${code}: ${Buffer.concat(errors).toString().trim()}`));
+    });
+    ffmpeg.stdin.end(mp3);
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Baileys socket lifecycle
@@ -252,8 +339,14 @@ async function connectSocket(): Promise<WASocket> {
       }
 
       if (connection === "close") {
+        // A previous socket can finish closing after a newer socket has already
+        // connected. Never let that stale event clear or reconnect the live one.
+        if (socket !== sock) return;
+
         const statusCode = (lastDisconnect?.error as Boom)?.output?.statusCode;
-        const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+        const shouldReconnect =
+          statusCode !== DisconnectReason.loggedOut &&
+          statusCode !== DisconnectReason.connectionReplaced;
         console.error(
           `[whatsapp] connection closed (status ${statusCode}), reconnecting: ${shouldReconnect}`,
         );
@@ -263,7 +356,10 @@ async function connectSocket(): Promise<WASocket> {
         syncToGlobal();
         if (shouldReconnect) {
           // Bounded delay to avoid hammering WhatsApp on rapid disconnects.
-          setTimeout(() => void connectSocket(), Math.min(2000, 500));
+          // Reattach the inbound listener as well as opening the replacement
+          // socket. `connectSocket()` alone leaves a reconnected socket unable
+          // to receive WhatsApp messages.
+          setTimeout(wireSocketListener, Math.min(2000, 500));
         }
       } else if (connection === "open") {
         console.info("[whatsapp] connected");
@@ -328,6 +424,13 @@ async function bootstrapFrom(): Promise<void> {
 // Inbound message dispatch
 // ---------------------------------------------------------------------------
 
+function queueReplyMode(jid: string, voiceReply: boolean): void {
+  const modes = replyModes.get(jid) ?? [];
+  modes.push(voiceReply);
+  replyModes.set(jid, modes);
+  syncToGlobal();
+}
+
 /** Dispatch a parsed message to eve, queuing if `from` isn't captured yet. */
 async function dispatchInbound(
   jid: string,
@@ -335,11 +438,14 @@ async function dispatchInbound(
   state: WhatsAppState,
 ): Promise<void> {
   if (capturedFrom) {
+    queueReplyMode(jid, state.voiceReply);
+    console.info(`[whatsapp] dispatching inbound message for jid=${jid} voiceReply=${state.voiceReply}`);
     await capturedFrom(jid).send(content, { auth: null, state });
     return;
   }
   // `from` not captured yet — queue for when the bootstrap route fires.
   messageQueue.push({ jid, content, state });
+  console.info(`[whatsapp] queued inbound message for jid=${jid}; dispatcher unavailable`);
   syncToGlobal();
   // Safety net: if the automatic bootstrap from `connection.update → open`
   // hasn't succeeded yet (e.g. eve started after WhatsApp connected), trigger
@@ -371,6 +477,7 @@ function wireSocketListener(): void {
     sock.ev.on(
       "messages.upsert",
       async ({ messages, type }: BaileysEventMap["messages.upsert"]) => {
+        console.info(`[whatsapp] messages.upsert type=${type} count=${messages.length}`);
         // Only process genuinely new messages delivered in real time.
         // `type === "notify"` means the message was received live while the
         // socket was connected. `type === "append"` means the message is being
@@ -410,7 +517,10 @@ async function handleInboundMessage(msg: WAMessage): Promise<void> {
   const jid = msg.key.remoteJid;
   if (!jid || !isDM(jid)) return; // DMs only — no groups, broadcasts, etc.
 
-  if (msg.key.fromMe === true) return; // skip our own outbound echoes.
+  if (msg.key.fromMe === true) {
+    console.info("[whatsapp] ignoring outbound message echo");
+    return; // skip our own outbound echoes.
+  }
   // NOTE: This means WhatsApp's "Message Yourself" conversation cannot trigger
   // the bot. Test from another WhatsApp account/number.
 
@@ -419,6 +529,7 @@ async function handleInboundMessage(msg: WAMessage): Promise<void> {
   const normalizedMessage = normalizeMessageContent(msg.message);
   const type = getContentType(normalizedMessage ?? undefined);
   if (!type || type === "stickerMessage") return; // stickers excluded.
+  console.info(`[whatsapp] handling inbound jid=${jid} type=${type}`);
 
   const parts: UserContent = [];
   let voiceReply = false;
@@ -435,6 +546,25 @@ async function handleInboundMessage(msg: WAMessage): Promise<void> {
           : content?.extendedTextMessage?.text;
       if (!text) break;
 
+      const command = text.trim().toLowerCase();
+      if (command === "/clear" || command === "/reset") {
+        if (!capturedFrom) {
+          parts.push({ type: "text", text: "The WhatsApp connection is still starting. Please try again." });
+          break;
+        }
+
+        if (command === "/clear") {
+          await capturedFrom(jid).clear();
+          await socket?.sendMessage(jid, {
+            text: "Conversation history cleared. I still retain this session's state.",
+          });
+        } else {
+          await capturedFrom(jid).reset({ reason: "User requested a fresh WhatsApp conversation" });
+          await socket?.sendMessage(jid, { text: "Conversation reset. Your next message starts fresh." });
+        }
+        return;
+      }
+
       // If there's a pending HITL request for this JID, resolve it via
       // respond() instead of starting a new turn. This routes the user's
       // numeric or freeform reply to the correct requestId.
@@ -446,7 +576,13 @@ async function handleInboundMessage(msg: WAMessage): Promise<void> {
     }
 
     case "audioMessage": {
-      voiceReply = content?.audioMessage?.ptt === true;
+      // WhatsApp clients do not always set `ptt` consistently. Treat every
+      // inbound audio message as a request for a voice reply; otherwise a
+      // genuine voice note can silently receive a text response.
+      voiceReply = true;
+      console.info(
+        `[whatsapp] inbound audio ptt=${content?.audioMessage?.ptt === true} mime=${content?.audioMessage?.mimetype ?? "audio/ogg"}`,
+      );
       // Pass socket.updateMediaMessage as reuploadRequest so Baileys can request
       // a re-upload if the media URL has expired.
       const audio = socket
@@ -456,23 +592,20 @@ async function handleInboundMessage(msg: WAMessage): Promise<void> {
           })
         : await downloadMediaMessage(msg, "buffer", {});
       if (audio) {
-        parts.push({
-          type: "file",
-          data: audio as Buffer,
-          mediaType: content?.audioMessage?.mimetype ?? "audio/ogg",
-        });
+        const mediaType = content?.audioMessage?.mimetype ?? "audio/ogg";
+        try {
+          const transcript = await transcribeVoiceNote(audio as Buffer, mediaType);
+          if (transcript) {
+            console.info(`[whatsapp] Deepgram transcribed voice note length=${transcript.length}`);
+            parts.push({ type: "text", text: `Voice message transcript: ${transcript}` });
+          } else {
+            parts.push({ type: "text", text: "Voice message received, but no speech was detected." });
+          }
+        } catch (err) {
+          console.error("[whatsapp] Deepgram transcription failed; forwarding raw audio", err);
+          parts.push({ type: "file", data: audio as Buffer, mediaType });
+        }
       }
-
-      // --- STT hook -----------------------------------------------------
-      // To transcribe the voice note before the model sees it, call your STT
-      // provider here and push a text part instead of (or alongside) the file:
-      //
-      //   const transcript = await mySTT(audio as Buffer);
-      //   parts.push({ type: "text", text: transcript });
-      //
-      // Remove the file part above if you don't want the raw audio to reach
-      // the model. Deepgram is a good fit — leave this hook clean for later.
-      // ------------------------------------------------------------------
       break;
     }
 
@@ -626,6 +759,7 @@ async function tryResolveHITL(jid: string, text: string): Promise<boolean> {
 // ---------------------------------------------------------------------------
 
 async function sendText(sock: WASocket, jid: string, text: string): Promise<void> {
+  console.info(`[whatsapp] sending text reply to jid=${jid} length=${text.length}`);
   const MAX = 65536;
   if (text.length <= MAX) {
     await sock.sendMessage(jid, { text });
@@ -636,28 +770,25 @@ async function sendText(sock: WASocket, jid: string, text: string): Promise<void
   }
 }
 
-/**
- * Send a voice-note reply. Until TTS is wired, this falls back to plain text.
- *
- * Voice-note replies are NOT currently supported. The `voiceReply` state flag
- * is set when the user sends a voice note, but the reply is delivered as text
- * because no TTS provider is configured. To enable actual voice replies, plug
- * in a TTS provider here:
- *
- *   const audio = await myTTS(text);
- *   await sock.sendMessage(jid, {
- *     audio: { url: audio.url },       // or { bytes: audio.buffer }
- *     ptt: true,
- *     seconds: audio.seconds,
- *   });
- */
+/** Send a Cartesia-generated WhatsApp voice-note reply. */
 async function sendVoiceNote(sock: WASocket, jid: string, text: string): Promise<void> {
-  // TODO: Replace with your TTS provider call.
-  // const audio = await tts(text);
-  // await sock.sendMessage(jid, { audio: { url: audio.url }, ptt: true, seconds: audio.seconds });
-
-  // Fallback: send as text until TTS is wired.
-  await sendText(sock, jid, text);
+  try {
+    const cartesia = new Cartesia({ apiKey: getRequiredEnv("CARTESIA_API_KEY") });
+    const response = await cartesia.tts.generate({
+      model_id: CARTESIA_MODEL,
+      transcript: text,
+      voice: { id: getRequiredEnv("CARTESIA_VOICE_ID") },
+      language: "en",
+      output_format: { container: "mp3", sample_rate: 44100, bit_rate: 128000 },
+    });
+    const mp3 = Buffer.from(await response.arrayBuffer());
+    const audio = await mp3ToWhatsAppVoiceNote(mp3);
+    console.info(`[whatsapp] sending Cartesia voice reply to jid=${jid} oggOpusBytes=${audio.length}`);
+    await sock.sendMessage(jid, { audio, mimetype: "audio/ogg; codecs=opus", ptt: true });
+  } catch (err) {
+    console.error("[whatsapp] Cartesia TTS failed; falling back to text", err);
+    await sendText(sock, jid, text);
+  }
 }
 
 async function markRead(sock: WASocket, key: WAMessageKey): Promise<void> {
@@ -746,6 +877,7 @@ export default defineChannel<WhatsAppState, WhatsAppChannelContext>({
         const queued = messageQueue.shift()!;
         syncToGlobal();
         try {
+          queueReplyMode(queued.jid, queued.state.voiceReply);
           await from(queued.jid).send(queued.content, { auth: null, state: queued.state });
         } catch (err) {
           console.error("[whatsapp] failed to drain queued message", err);
@@ -778,6 +910,14 @@ export default defineChannel<WhatsAppState, WhatsAppChannelContext>({
   events: {
     async "turn.started"(_event, channel) {
       const { state, socket: sock } = channel;
+      const modes = replyModes.get(state.jid);
+      const voiceReply = modes?.shift() ?? state.voiceReply;
+      if (modes && modes.length === 0) replyModes.delete(state.jid);
+      activeReplyModes.set(state.jid, voiceReply);
+      syncToGlobal();
+      console.info(
+        `[whatsapp] agent turn started jid=${state.jid || "(missing)"} socket=${Boolean(sock)} voiceReply=${voiceReply}`,
+      );
       if (sock && state.jid) await sendTyping(sock, state.jid);
     },
 
@@ -833,12 +973,17 @@ export default defineChannel<WhatsAppState, WhatsAppChannelContext>({
 
     async "message.completed"(event, channel) {
       const { state, socket: sock } = channel;
+      console.info(
+        `[whatsapp] message.completed jid=${state.jid || "(missing)"} socket=${Boolean(sock)} finish=${event.finishReason ?? "unknown"} hasMessage=${Boolean(event.message)}`,
+      );
       if (!sock || !state.jid) return;
 
       // Skip interim assistant text emitted before a tool call.
       if (event.finishReason === "tool-calls" || !event.message) return;
 
-      if (state.voiceReply) {
+      const voiceReply = activeReplyModes.get(state.jid) ?? state.voiceReply;
+      console.info(`[whatsapp] delivering reply jid=${state.jid} voiceReply=${voiceReply}`);
+      if (voiceReply) {
         await sendVoiceNote(sock, state.jid, event.message);
       } else {
         await sendText(sock, state.jid, event.message);
@@ -849,11 +994,14 @@ export default defineChannel<WhatsAppState, WhatsAppChannelContext>({
 
     async "session.waiting"(_event, channel) {
       const { state, socket: sock } = channel;
+      activeReplyModes.delete(state.jid);
+      syncToGlobal();
       if (sock && state.jid) await sendPaused(sock, state.jid);
     },
 
     async "turn.failed"(event, channel) {
       const { state, socket: sock } = channel;
+      console.error(`[whatsapp] agent turn failed jid=${state.jid || "(missing)"}`, event);
       if (!sock || !state.jid) return;
       const message = event.message ?? "Something went wrong. Please try again.";
       await sendText(sock, state.jid, message);
@@ -861,6 +1009,7 @@ export default defineChannel<WhatsAppState, WhatsAppChannelContext>({
 
     async "session.failed"(event, channel) {
       const { state, socket: sock } = channel;
+      console.error(`[whatsapp] session failed jid=${state.jid || "(missing)"}`, event);
       if (!sock || !state.jid) return;
       const detailMessage = event.details?.message;
       const message =

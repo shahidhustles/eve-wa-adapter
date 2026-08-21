@@ -18,8 +18,7 @@ session turns; agent replies are sent back as WhatsApp messages.
 **Supported:**
 
 - Text messages (send + receive)
-- Voice notes / PTT (receive — passed to the agent as an audio file; replies are
-  sent as **text**, not voice, until TTS is wired)
+- Voice notes / PTT (Deepgram Nova-3 transcription; Cartesia Sonic 3.5 voice-note replies)
 - Images with captions (receive)
 - Video with captions (receive)
 - GPS location (receive, passed to agent as text coordinates)
@@ -93,58 +92,24 @@ operation — the QR code is the only setup step.
 | Auth directory | `AUTH_DIR` constant in `whatsapp.ts` | `./auth_info_baileys` | Where Baileys stores session credentials |
 | Browser name | `Browsers.ubuntu("eve-whatsapp")` in `connectSocket()` | `eve-whatsapp` | WhatsApp "Linked Device" label |
 | Turn policy | `defineChannel({ turnPolicy: "queue" })` | `queue` | Turns finish in order; no steering |
+| Deepgram key | `DEEPGRAM_API_KEY` env var | — | Required to transcribe inbound voice notes with Nova-3 |
+| Cartesia key | `CARTESIA_API_KEY` env var | — | Required for voice-note replies with Sonic 3.5 |
+| Cartesia voice | `CARTESIA_VOICE_ID` env var | — | The Cartesia voice ID used for replies |
 
-## Wiring STT (speech-to-text)
+## Voice setup
 
-Voice notes are passed to the agent as raw audio files (`audio/ogg`). To
-transcribe them before the model sees them, edit the STT hook in
-`agent/channels/whatsapp.ts` (around line 240, inside the `audioMessage`
-case):
+Add these values to `.env.local` (keep real keys out of source control):
 
-```ts
-case "audioMessage": {
-  voiceReply = msg.message?.audioMessage?.ptt === true;
-  const audio = await downloadMediaMessage(msg, "buffer", {});
-
-  // --- Add your STT call here ---
-  const transcript = await mySTTProvider.transcribe(audio);
-  parts.push({ type: "text", text: transcript });
-  // -------------------------------
-
-  // Remove or comment out the raw audio file part if you don't want
-  // the model to receive the audio directly.
-  break;
-}
+```bash
+DEEPGRAM_API_KEY=...
+CARTESIA_API_KEY=...
+CARTESIA_VOICE_ID=...
 ```
 
-Any STT provider works: OpenAI Whisper, Deepgram, Google Speech-to-Text, etc.
-
-## Wiring TTS (text-to-speech)
-
-When the inbound message is a voice note, the channel sets `state.voiceReply = true`
-and replies go through `sendVoiceNote()`. **Voice-note replies are NOT currently
-supported** — `sendVoiceNote()` falls back to plain text. To send actual voice
-replies, edit the TTS hook in `agent/channels/whatsapp.ts` (inside
-`sendVoiceNote()`):
-
-```ts
-async function sendVoiceNote(sock: WASocket, jid: string, text: string): Promise<void> {
-  // --- Add your TTS call here ---
-  const audio = await myTTSProvider.synthesize(text);
-  await sock.sendMessage(jid, {
-    audio: { url: audio.url },     // or { bytes: audio.buffer }
-    ptt: true,
-    seconds: audio.seconds,
-  });
-  // -------------------------------
-}
-```
-
-Any TTS provider works: OpenAI tts-1, ElevenLabs, Google TTS, AWS Polly, etc.
-
-Until TTS is wired, the `voiceReply` flag only affects the outbound delivery
-path — the agent's text reply is sent as plain text regardless of whether the
-user sent a voice note.
+Inbound voice notes are transcribed with Deepgram Nova-3 before the agent sees
+them. Replies to voice notes are synthesized with Cartesia Sonic 3.5, then
+converted to WhatsApp-compatible Ogg/Opus audio. If either provider is unavailable, the adapter logs
+the error and falls back to forwarding raw audio (STT) or sending text (TTS).
 
 ## How it works
 
